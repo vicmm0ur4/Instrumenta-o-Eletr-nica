@@ -1,0 +1,208 @@
+#include <AFMotor.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <avr/wdt.h> // Biblioteca para o watchdog real
+
+// --- Motor ---
+AF_DCMotor motor(1);
+int potPin = A7;
+
+// --- Suavização do Potenciômetro ---
+#define POT_SMOOTH 5 // Número de amostras para a média móvel
+int potBuffer[POT_SMOOTH] = {0}; // Buffer para armazenar leituras
+byte potBufferIndex = 0; // Índice do buffer
+
+MPU6050 mpu;
+float offsetX = 0, offsetY = 0, offsetZ = 0;
+
+const byte encoderPin = 18;
+volatile unsigned long pulseCount = 0; // MUST be volatile for ISR access
+const int dentesPorVolta = 20;
+
+unsigned long lastCommunicationTime = 0;
+// Intervalo de comunicação de 100ms (10 Hz) para reduzir carga
+const unsigned long communicationInterval = 100; // Envia dados a cada 100ms (10 Hz)
+
+float currentRPS = 0;
+// N_SMOOTH: Número de amostras para a média móvel do RPM
+#define N_SMOOTH 20 
+float rpmBuffer[N_SMOOTH] = {0};
+byte rpmBufferIndex = 0;
+float filteredRPM = 0; 
+
+const int maxPWM = 204; // PWM máximo reduzido (80% de 255)
+
+// --- Watchdog Simples (LED para depuração) ---
+#define WATCHDOG_PIN 13 // Pino do LED embutido
+unsigned long lastWatchdogToggle = 0;
+const unsigned long watchdogToggleInterval = 500; // Pisca a cada 500ms
+
+void setup() {
+  // Inicializa a comunicação serial com baudrate 115200
+  // Alta taxa para evitar sobrecarga do buffer
+  Serial.begin(9600); 
+
+  // Aguarda até que a porta serial esteja conectada (necessário para Arduino Mega)
+  while (!Serial) {
+    ; // Aguarda conexão serial
+  }
+
+  // Inicializa o motor apenas uma vez
+  motor.setSpeed(0);
+  motor.run(FORWARD); 
+
+  Wire.begin();
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("ERRO: MPU6050 não conectado! Verifique as conexões.");
+    while(true); // Para o programa se o MPU não for encontrado
+  }
+  calibrateAccelerometer();
+
+  pinMode(encoderPin, INPUT_PULLUP); // Ativa pull-up interno para o encoder
+  // Anexa a rotina de interrupção para o pino do encoder
+  attachInterrupt(digitalPinToInterrupt(encoderPin), countPulse, RISING);
+
+  // Configura o pino do Watchdog (LED)
+  pinMode(WATCHDOG_PIN, OUTPUT);
+  digitalWrite(WATCHDOG_PIN, LOW); // Começa com o LED desligado
+
+  // Ativa o watchdog real para reiniciar após 2 segundos sem reset
+  wdt_enable(WDTO_2S);
+
+  Serial.println("Arduino: Monitoramento de Vibração e Rotação pronto.");
+}
+
+void loop() {
+  // Reseta o watchdog a cada loop para evitar reinicialização
+  wdt_reset();
+
+  unsigned long currentTime = millis();
+
+  // --- Controle do motor com suavização ---
+  // Lê o potenciômetro e aplica média móvel para reduzir ruído
+  int potValue = analogRead(potPin);
+  potBuffer[potBufferIndex++] = potValue;
+  if (potBufferIndex >= POT_SMOOTH) potBufferIndex = 0;
+  int sum = 0;
+  for (byte i = 0; i < POT_SMOOTH; i++) {
+    sum += potBuffer[i];
+  }
+  int smoothedPotValue = sum / POT_SMOOTH; // Média das últimas 5 leituras
+  int motorPWM = map(smoothedPotValue, 0, 1023, 0, maxPWM);
+  motor.setSpeed(motorPWM);
+
+  // --- Rotina de comunicação temporizada ---
+  if (currentTime - lastCommunicationTime >= communicationInterval) {
+    // 1. Calcula a velocidade e filtra
+    calculateSpeed(); 
+
+    // 2. Envia os dados serial apenas se o buffer tiver espaço
+    if (Serial.availableForWrite() > 32) { // Verifica se há espaço no buffer
+      sendData();
+    } else {
+      Serial.println("AVISO: Buffer serial cheio!");
+    }
+
+    lastCommunicationTime = currentTime; 
+  }
+
+  // --- Watchdog: Pisca o LED para indicar que o loop está ativo ---
+  if (currentTime - lastWatchdogToggle >= watchdogToggleInterval) {
+    digitalWrite(WATCHDOG_PIN, !digitalRead(WATCHDOG_PIN)); // Inverte o estado do LED
+    lastWatchdogToggle = currentTime;
+  }
+}
+
+// --- Funções Auxiliares ---
+
+void calculateSpeed() {
+  // Desativa interrupções para ler pulseCount com segurança
+  noInterrupts(); 
+  unsigned long currentPulses = pulseCount;
+  pulseCount = 0; // Reseta o contador
+  interrupts();   // Reativa as interrupções
+
+  float rotations = (float)currentPulses / dentesPorVolta;
+  float seconds = communicationInterval / 1000.0; 
+  
+  // Evita divisão por zero
+  if (seconds > 0) {
+      currentRPS = rotations / seconds;
+  } else {
+      currentRPS = 0; 
+  }
+
+  // Adiciona a amostra atual ao buffer da média móvel
+  rpmBuffer[rpmBufferIndex++] = currentRPS;
+  if (rpmBufferIndex >= N_SMOOTH) {
+    rpmBufferIndex = 0; // Volta ao início do buffer
+  }
+
+  // Calcula a média das amostras no buffer
+  float sum = 0;
+  for (byte i = 0; i < N_SMOOTH; i++) {
+    sum += rpmBuffer[i];
+  }
+  filteredRPM = sum / N_SMOOTH;
+}
+
+void sendData() {
+  // Lê o MPU6050 apenas a cada dois ciclos (5 Hz) para reduzir carga no I2C
+  static bool readMPU = true;
+  static float accelX = 0, accelY = 0, accelZ = 0;
+  
+  if (readMPU) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    accelX = (float)ax / 16384.0 - offsetX;
+    accelY = (float)ay / 16384.0 - offsetY;
+    accelZ = (float)az / 16384.0 - offsetZ;
+  }
+  readMPU = !readMPU; // Alterna entre ler e reutilizar dados
+
+  // Envia os dados no formato original para compatibilidade com MATLAB
+  // Formato: filteredRPM,accelX,accelY,accelZ\n
+  Serial.print(filteredRPM, 2); // 2 casas decimais para RPS
+  Serial.print(",");
+  Serial.print(accelX, 3); // 3 casas decimais para aceleração
+  Serial.print(",");
+  Serial.print(accelY, 3);
+  Serial.print(",");
+  Serial.println(accelZ, 3); // println para adicionar a quebra de linha
+}
+
+// Rotina de Interrupção do Encoder
+void countPulse() {
+  static unsigned long lastDebounceTime = 0;
+  unsigned long currentMicros = micros();
+  // Debounce de 5000 micros para evitar interrupções excessivas
+  if (currentMicros - lastDebounceTime > 5000) { 
+    pulseCount++;
+    lastDebounceTime = currentMicros;
+  }
+}
+
+// Rotina de Calibração do Acelerômetro
+void calibrateAccelerometer() {
+  long sumX = 0, sumY = 0, sumZ = 0;
+  const int numSamples = 100;
+
+  Serial.println("Calibrando acelerometro... NAO MOVA O SENSOR.");
+  for (int i = 0; i < numSamples; i++) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    sumX += ax;
+    sumY += ay;
+    sumZ += az;
+    delay(5); // Pequeno atraso para estabilizar a leitura
+  }
+
+  offsetX = (sumX / (float)numSamples) / 16384.0;
+  offsetY = (sumY / (float)numSamples) / 16384.0;
+  offsetZ = (sumZ / (float)numSamples) / 16384.0;
+
+  Serial.print("Offsets Calibrados: X="); Serial.print(offsetX, 4);
+  Serial.print(", Y="); Serial.print(offsetY, 4);
+  Serial.print(", Z="); Serial.println(offsetZ, 4);
+}
