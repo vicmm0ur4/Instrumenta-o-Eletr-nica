@@ -1,0 +1,104 @@
+//------------------MOTOR------------------------------------------------------------------------------------------
+#include <AFMotor.h>
+AF_DCMotor motor(2);      // 
+const int potPin = A12;    // Potenciômetro no pino A7
+//-------------------------------------------------------------------------------------------------------------
+
+
+//--------------- E N C O D E R ----------------------------------------------------------------------------------
+#define ENCODER 18    // Pino digital para o sensor de velocidade (encoder)
+#define N_DENTES 16  //Numero de dentes da engrenagem
+
+int pulseCount = 0; // Variável para contar os pulsos do encoder
+unsigned long previousMillis = 0; // Variável para armazenar o tempo anterior para cálculo do intervalo
+const long interval = 100;  // Intervalo de tempo para cálculo do RPM (1 segundo)
+float rpmvar=0; //usei pra plotar a rotacao medida em tempo real
+int q=0;
+
+    //media movel
+    #define QTD_Mmovel 10 
+    float janelaRPM[QTD_Mmovel] = {0};  // Vetor armazena as últimas QTD_Mmovel leituras
+    int indiceRPM = 0;
+    float rpmMovel = 0;
+
+// Função de interrupção para contar os pulsos do encoder
+void countPulse() {
+  pulseCount++;
+}
+//-------------------------------------------------------------------------------------------------------------
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void setup() {
+  Serial.begin(9600);  // Inicializa a comunicação serial para depuração
+
+//--------------- E N C O D E R ----------------------------------------------------------------------------------
+  pinMode(ENCODER, INPUT);  // Configura os pinos como entrada ou saída
+  attachInterrupt(digitalPinToInterrupt(ENCODER), countPulse, RISING);  // Configura a interrupção no pino do encoder para contar os pulsos na borda de subida
+//-------------------------------------------------------------------------------------------------------------
+
+//------------------MOTOR------------------------------------------------------------------------------------------
+  motor.setSpeed(0);
+  motor.run(FORWARD);
+//-------------------------------------------------------------------------------------------------------------
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void loop() {
+//------------------MOTOR------------------------------------------------------------------------------------------
+  int potValue = analogRead(potPin);
+  int pwmValue = map(potValue, 0, 1023, 0, 100); //limitei aqui p rpm nao subir tanto
+  motor.setSpeed(pwmValue);
+//-------------------------------------------------------------------------------------------------------------
+
+//--------------- E N C O D E R ----------------------------------------------------------------------------------
+  // Verifica se já passou o intervalo de 1 segundo
+  unsigned long currentMillis = millis();
+  unsigned long deltaT = currentMillis - previousMillis;
+
+  
+  if (deltaT >= interval) {
+
+    noInterrupts();     // Desabilita temporariamente as interrupções para copiar o valor dos pulsos
+    int pulses = pulseCount;
+    pulseCount = 0;  // Reseta o contador de pulsos
+    interrupts();  // Habilita as interrupções novamente
+
+    previousMillis = currentMillis;  // Atualiza o tempo anterior
+
+    float rpm = ((float)pulses/N_DENTES)*(1000/deltaT)*60;     // Calcula o RPM (rotações por minuto)
+    rpmvar = rpm; // só criei isso p plotar o rpm sem a Mmovel
+
+        //Média Móvel (ajuda GPT)
+           janelaRPM[indiceRPM] = rpm;  // Salva o valor atual no vetor
+            indiceRPM = (indiceRPM + 1) % QTD_Mmovel;  //quando indiceRPM chega no final (ex: 9 se TAM_JANELA = 10), o próximo valor será:(9 + 1) % 10 = 0
+           float soma = 0;
+           for (int i = 0; i < QTD_Mmovel; i++) {
+             soma += janelaRPM[i];
+          }
+           rpmMovel = soma / QTD_Mmovel;
+
+  }
+
+//-------------------------------------------------------------------------------------------------------------
+
+// TODOS OS PRINTS
+
+    Serial.print(rpmMovel); Serial.print(",");            // 1 - RPMMMOVEL
+    Serial.print(rpmvar); Serial.print(",");              // 2 - RPM CALCULO
+    Serial.print(0); Serial.print(",");Serial.print(2000);Serial.print(",");   // 3 - ZERO  4 - 3000
+    //Serial.print((a.acceleration.x+9.389)); 
+    Serial.println();     // 5-ACELERACAO ------ COLOQUEI UMA LEVE CORRECAO DE G P PLOTAR NO Y=0
+
+      //Serial.println(pwmValue);
+
+  // Pequeno delay para evitar travamentos
+  delay(10);
+
+
+}
