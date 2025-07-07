@@ -1,0 +1,48 @@
+% === CONFIGURAÇÃO SERIAL ===
+porta = "COM10";  % <<< altere conforme necessário
+baudrate = 115200;
+s = serialport(porta, baudrate, "Timeout", 0.1);
+
+configureTerminator(s, "LF");
+flush(s);
+
+% === INICIALIZAÇÃO ===
+tempoInicial = tic;
+janela = 20;  % segundos visíveis
+
+% === CONFIGURAÇÃO DO GRÁFICO ===
+figure('Name','Aceleração da barra','NumberTitle','off');
+graf = animatedline('Color', 'r');
+ylim([-50 50]);
+xlabel('Tempo (s)');
+ylabel('Aceleração (m/s²)');
+title('Aceleração da barra');
+grid on;
+
+% === LOOP PRINCIPAL — sem acúmulo de dados ===
+while true
+    if s.NumBytesAvailable > 0
+        try
+            linha = readline(s);
+            dado = str2double(strtrim(linha));
+            
+            if ~isnan(dado)
+                t = toc(tempoInicial);
+
+                % Adiciona novo ponto ao gráfico
+                addpoints(graf, t, dado);
+
+                % Atualiza apenas o eixo X (rolling window)
+                if t > janela
+                    xlim([t - janela, t]);
+                else
+                    xlim([0, janela]);
+                end
+
+                drawnow limitrate
+            end
+        catch
+            % Silencia erros de leitura
+        end
+    end
+end
